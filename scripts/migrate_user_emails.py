@@ -1,19 +1,20 @@
-"""Export or import Ark user email addresses.
+"""Export or import Ark user email addresses without starting an app container.
 
-The export contains only email addresses. Import creates missing users with the
+Install the only dependency once with ``python3 -m pip install asyncpg``. The
+export contains only email addresses. Import creates missing users with the
 selected role; it does not copy passwords, tokens, messages, or profile data.
 """
 
 import argparse
 import asyncio
 import json
+import secrets
 import sys
+import time
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
-import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from modules.users.models import Role, User
+PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,8 +24,7 @@ def parse_args() -> argparse.Namespace:
     export = commands.add_parser("export", help="Export active user emails to JSON.")
     export.add_argument(
         "--source-database-url",
-        required=True,
-        help="SQLAlchemy asyncpg URL of the database to read from.",
+        help="PostgreSQL URL of the database to read from (default: DATABASE_URL in .env).",
     )
     export.add_argument("--output", type=Path, required=True, help="Output JSON file.")
 
@@ -32,8 +32,7 @@ def parse_args() -> argparse.Namespace:
     import_.add_argument("--input", type=Path, required=True, help="Input JSON file.")
     import_.add_argument(
         "--target-database-url",
-        required=True,
-        help="SQLAlchemy asyncpg URL of the database to write to.",
+        help="PostgreSQL URL of the database to write to (default: DATABASE_URL in .env).",
     )
     import_.add_argument(
         "--role",
@@ -53,9 +52,73 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_database_url(url: str, option: str) -> None:
-    if not url.startswith("postgresql+asyncpg://"):
-        raise ValueError(f"{option} must start with postgresql+asyncpg://")
+def database_url(url: str, option: str) -> str:
+    scheme, separator, rest = url.partition("://")
+    if separator and scheme.startswith("postgresql+"):
+        url = f"postgresql://{rest}"
+    if not url.startswith(("postgresql://", "postgres://")):
+        raise ValueError(f"{option} must start with postgresql:// or postgres://")
+    parsed = urlsplit(url)
+    if parsed.hostname != "db":
+        return url
+
+    credentials, _, host = parsed.netloc.rpartition("@")
+    host = host.replace("db", "127.0.0.1", 1)
+    netloc = f"{credentials}@{host}" if credentials else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def env_file_path() -> Path:
+    current_directory_env = Path.cwd() / ".env"
+    if current_directory_env.exists():
+        return current_directory_env
+    return PROJECT_ENV_FILE
+
+
+def read_env_values() -> dict[str, str]:
+    env_file = env_file_path()
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ValueError(f"Cannot read {env_file}: {error}") from error
+
+    values = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, separator, value = line.partition("=")
+        if separator:
+            value = value.strip()
+            if value[:1] in {"'", '"'} and value[-1:] == value[:1]:
+                value = value[1:-1]
+            if value:
+                values[key.strip()] = value
+    return values
+
+
+def database_url_from_env() -> str:
+    values = read_env_values()
+    if database_url := values.get("DATABASE_URL"):
+        return database_url
+
+    user = values.get("POSTGRES_USER", "postgres")
+    password = values.get("POSTGRES_PASSWORD")
+    database_name = values.get("POSTGRES_DB")
+    if password and database_name:
+        host = values.get("POSTGRES_HOST", "127.0.0.1")
+        port = values.get("POSTGRES_PORT", "5432")
+        return (
+            f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+            f"@{host}:{port}/{quote(database_name, safe='')}"
+        )
+
+    raise ValueError(
+        f"DATABASE_URL or POSTGRES_PASSWORD and POSTGRES_DB are not set in "
+        f"{env_file_path()}"
+    )
 
 
 def normalize_emails(emails: list[object]) -> list[str]:
@@ -68,23 +131,30 @@ def normalize_emails(emails: list[object]) -> list[str]:
     )
 
 
-async def fetch_source_emails(source_url: str) -> list[str]:
-    engine = create_async_engine(source_url)
+def new_ulid() -> str:
+    """Return a 26-character Crockford Base32 ULID using only stdlib."""
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = (int(time.time() * 1000) << 80) | secrets.randbits(80)
+    result = ""
+    for _ in range(26):
+        result = alphabet[value & 31] + result
+        value >>= 5
+    return result
+
+
+async def fetch_source_emails(asyncpg: object, source_url: str) -> list[str]:
+    connection = await asyncpg.connect(source_url)
     try:
-        async with engine.connect() as connection:
-            result = await connection.execute(
-                sa.text(
-                    "SELECT email FROM users "
-                    "WHERE deleted_at IS NULL ORDER BY email"
-                )
-            )
-            return normalize_emails(list(result.scalars()))
+        rows = await connection.fetch(
+            "SELECT email FROM users WHERE deleted_at IS NULL ORDER BY email"
+        )
+        return normalize_emails([row["email"] for row in rows])
     finally:
-        await engine.dispose()
+        await connection.close()
 
 
-async def export_emails(args: argparse.Namespace) -> None:
-    emails = await fetch_source_emails(args.source_database_url)
+async def export_emails(asyncpg: object, args: argparse.Namespace) -> None:
+    emails = await fetch_source_emails(asyncpg, args.source_database_url)
     payload = {"format_version": 1, "emails": emails}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
@@ -109,67 +179,89 @@ def load_emails(input_path: Path) -> list[str]:
     return normalize_emails(emails)
 
 
-async def import_emails(args: argparse.Namespace) -> None:
+async def import_emails(asyncpg: object, args: argparse.Namespace) -> None:
     source_emails = load_emails(args.input)
-    target_engine = create_async_engine(args.target_database_url)
-    session_factory = async_sessionmaker(target_engine, class_=AsyncSession)
+    connection = await asyncpg.connect(args.target_database_url)
     try:
-        async with session_factory() as session:
-            role_result = await session.execute(
-                sa.select(Role).where(Role.name == args.role)
-            )
-            role = role_result.scalar_one_or_none()
-            if role is None:
-                raise RuntimeError(
-                    f"Role {args.role!r} is absent in the target database. "
-                    "Run Alembic migrations and start the API once first."
-                )
+        role_id = await connection.fetchval(
+            "SELECT id FROM roles WHERE name = $1", args.role
+        )
+        role_missing = role_id is None
 
-            existing_result = await session.execute(sa.select(User.email))
-            existing_emails = normalize_emails(list(existing_result.scalars()))
-            emails_to_create = [
-                email for email in source_emails if email not in set(existing_emails)
-            ]
-            print(
-                f"File contains: {len(source_emails)} unique email(s); "
-                f"target already contains: {len(existing_emails)}; "
-                f"to create: {len(emails_to_create)}."
-            )
-            if args.verbose:
-                for email in emails_to_create:
-                    print(email)
-
-            if not args.apply:
-                print("Dry run complete. Re-run with --apply to create these users.")
-                return
-
+        existing_emails = normalize_emails(
+            [row["email"] for row in await connection.fetch("SELECT email FROM users")]
+        )
+        existing_email_set = set(existing_emails)
+        emails_to_create = [
+            email for email in source_emails if email not in existing_email_set
+        ]
+        print(
+            f"File contains: {len(source_emails)} unique email(s); "
+            f"target already contains: {len(existing_emails)}; "
+            f"to create: {len(emails_to_create)}."
+        )
+        if role_missing:
+            print(f"Role {args.role!r} will also be created.")
+        if args.verbose:
             for email in emails_to_create:
-                user = User(
-                    email=email,
-                    is_active=True,
-                    is_approved=True,
-                    email_verified=True,
-                    status="active",
+                print(email)
+
+        if not args.apply:
+            print("Dry run complete. Re-run with --apply to create these users.")
+            return
+
+        async with connection.transaction():
+            if role_missing:
+                role_id = new_ulid()
+                await connection.execute(
+                    "INSERT INTO roles (id, name, is_system, is_default) "
+                    "VALUES ($1, $2, FALSE, TRUE)",
+                    role_id,
+                    args.role,
                 )
-                user.full_name = email.partition("@")[0].capitalize()
-                user.roles.append(role)
-                session.add(user)
-            await session.commit()
-            print(f"Created {len(emails_to_create)} user(s).")
+            for email in emails_to_create:
+                user_id = new_ulid()
+                await connection.execute(
+                    "INSERT INTO users "
+                    "(id, email, is_active, is_approved, first_name, last_name, "
+                    "status, email_verified) "
+                    "VALUES ($1, $2, TRUE, TRUE, $3, '', 'active', TRUE)",
+                    user_id,
+                    email,
+                    email.partition("@")[0].capitalize(),
+                )
+                await connection.execute(
+                    "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)",
+                    user_id,
+                    role_id,
+                )
+        print(f"Created {len(emails_to_create)} user(s).")
     finally:
-        await target_engine.dispose()
+        await connection.close()
 
 
 async def main() -> int:
     args = parse_args()
     try:
+        import asyncpg
+    except ImportError:
+        print("Install dependency first: python3 -m pip install asyncpg", file=sys.stderr)
+        return 1
+
+    try:
         if args.command == "export":
-            validate_database_url(args.source_database_url, "--source-database-url")
-            await export_emails(args)
+            args.source_database_url = database_url(
+                args.source_database_url or database_url_from_env(),
+                "--source-database-url or DATABASE_URL",
+            )
+            await export_emails(asyncpg, args)
         else:
-            validate_database_url(args.target_database_url, "--target-database-url")
-            await import_emails(args)
-    except (ValueError, RuntimeError, sa.SQLAlchemyError) as error:
+            args.target_database_url = database_url(
+                args.target_database_url or database_url_from_env(),
+                "--target-database-url or DATABASE_URL",
+            )
+            await import_emails(asyncpg, args)
+    except (OSError, RuntimeError, ValueError, asyncpg.PostgresError) as error:
         print(f"Migration failed: {error}", file=sys.stderr)
         return 1
     return 0

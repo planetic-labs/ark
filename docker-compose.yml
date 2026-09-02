@@ -1,22 +1,27 @@
+name: ark-api-dev
+
 services:
-  # Бэкенд (FastAPI)
   api:
+    image: ark-api
     build:
       context: .
       dockerfile: infra/api.Dockerfile
-    user: "${CURRENT_UID:-1000}:${CURRENT_GID:-1000}"
-    restart: unless-stopped
-    networks:
-      - planetic-net
+      args:
+        - USER_ID=${UID:-1000}
+        - GROUP_ID=${GID:-1000}
+    user: "${UID:-1000}:${GID:-1000}"
+    restart: always
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8355:8000"
+    networks:
+      - default
+      - planetic-net
     volumes:
-      # Прокидываем код бэкенда для авторелоада (Hot Reload)
       - .:/app
       - /app/.venv
       - uploads_data:/app/static/uploads
-    env_file:
-      - .env
+    env_file: .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/ark
       - REDIS_URL=redis://redis:6379/0
@@ -28,62 +33,86 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["uv", "run", "fastapi", "dev", "main.py", "--host", "0.0.0.0"]
+    command:
+      ["sh", "-c", "uv run alembic upgrade head && exec uv run fastapi dev main.py --host 0.0.0.0"]
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8000/health').close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
-  # База данных
   db:
     build:
       context: .
       dockerfile: infra/postgres.Dockerfile
     command: ["postgres", "-c", "shared_preload_libraries=pg_partman_bgw", "-c", "pg_partman_bgw.dbname=ark", "-c", "pg_partman_bgw.role=postgres"]
-    restart: unless-stopped
+    restart: always
+    stop_grace_period: 30s
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ark
-    networks:
-      - planetic-net
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ark"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
-  # Redis (для pub/sub и кэша)
   redis:
     image: redis:7-alpine
-    restart: unless-stopped
-    networks:
-      - planetic-net
+    restart: always
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
-  # Воркер фоновых задач ARQ
   worker:
+    image: ark-api
     build:
       context: .
       dockerfile: infra/api.Dockerfile
-    user: "${CURRENT_UID:-1000}:${CURRENT_GID:-1000}"
-    restart: unless-stopped
+      args:
+        - USER_ID=${UID:-1000}
+        - GROUP_ID=${GID:-1000}
+    user: "${UID:-1000}:${GID:-1000}"
+    restart: always
+    stop_grace_period: 30s
     networks:
+      - default
       - planetic-net
     volumes:
       - .:/app
       - /app/.venv
       - uploads_data:/app/static/uploads
-    env_file:
-      - .env
+    env_file: .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/ark
       - REDIS_URL=redis://redis:6379/0
@@ -91,17 +120,24 @@ services:
       - UV_LINK_MODE=copy
       - UV_NO_SYNC=1
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
+      api:
         condition: service_healthy
     command: ["uv", "run", "arq", "core.worker.WorkerSettings"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   postgres_data:
+    name: ark-api-dev-postgres-data
   redis_data:
+    name: ark-api-dev-redis-data
   uploads_data:
+    name: ark-api-dev-uploads-data
 
 networks:
+  default:
   planetic-net:
     external: true
