@@ -2,7 +2,7 @@ import asyncio
 
 import jwt
 import structlog
-from fastapi import APIRouter, WebSocket
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from core.websocket import manager
 
@@ -65,8 +65,19 @@ async def websocket_endpoint(
         while True:
             # Just keep connection alive
             await websocket.receive_text()
-    except Exception:
-        pass
+    except WebSocketDisconnect as error:
+        logger.info(
+            "WS disconnected",
+            user_id=user_id,
+            code=error.code,
+            reason=error.reason or "client disconnected",
+        )
+    except Exception as error:
+        logger.warning(
+            "WS connection lost",
+            user_id=user_id,
+            error_type=type(error).__name__,
+        )
     finally:
         online_task.cancel()
         manager.disconnect(user_id, websocket)

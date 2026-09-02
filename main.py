@@ -1,7 +1,9 @@
+import logging
+import os
+
 import structlog
 from fastapi import Depends, FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +22,9 @@ from modules.users.services_router import router as services_router
 
 # Setup logging
 logger = structlog.get_logger()
+# Ping timeouts are normal disconnects for mobile and browser clients. The
+# WebSocket route logs them as one structured event instead of a library trace.
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
 
 app = FastAPI(
     title="Ark Messenger API",

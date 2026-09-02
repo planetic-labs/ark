@@ -27,7 +27,6 @@ class ConnectionManager:
             self.active_connections[user_id].remove(websocket)
             if not self.active_connections[user_id]:
                 del self.active_connections[user_id]
-        logger.info("WS Disconnected", user_id=user_id)
 
     async def send_personal_message(self, message: dict, user_id: str):
         if user_id in self.active_connections:
