@@ -16,7 +16,7 @@ dependencies = [
     "alembic>=1.18.5",
     "pydantic-settings>=2.14.2",
     "pyjwt[crypto]>=2.13.0",
-    "resend>=2.32.2",
+    "resend>=2.34.0",
 ]
 
 [tool.uv]
